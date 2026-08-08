@@ -1,0 +1,81 @@
+# =============================================================================
+# group_vars — COPY TO all.yml AND EDIT. The real one is gitignored.
+# =============================================================================
+# Secrets belong in ansible-vault or the environment, NOT here in plaintext.
+# The two token fields below show both patterns; pick one and be consistent.
+# =============================================================================
+
+# --- Architecture: a first-class variable, not a future port ----------------
+# The lab cluster is amd64. An ARM edge-cluster rebuild uses THESE SAME
+# playbooks with this one value changed — image source, k3s binary arch and
+# per-arch sysctls all key off it. Retrofitting arch-awareness later is the
+# rework this exists to avoid.
+#
+# Supported: amd64 | arm64
+arch: amd64
+
+# --- Node substrate ---------------------------------------------------------
+# lxc — lighter and denser, matches how the edge nodes run. Needs the tuning
+#       in roles/k3s_node_prep (nesting, keyctl, AppArmor, /dev/kmsg,
+#       snapshotter). Well-documented, but Proxmox-version sensitive.
+# vm  — k3s "just works", no tuning at all. Costs more RAM/disk per node.
+#
+# THIS IS THE ESCAPE HATCH. If LXC fights you for more than an hour or two,
+# flip this to `vm` and re-run provision.yml. On a cluster whose purpose is
+# validating someone else's chart, runtime debugging is contamination.
+node_type: lxc
+
+# --- LXC specifics (ignored when node_type: vm) -----------------------------
+# The template must ALREADY exist on proxmox_template_storage. provision.yml
+# checks and prints the download command rather than guessing.
+lxc_template: "debian-12-standard_12.7-1_amd64.tar.zst"
+
+# k3s in LXC needs an unprivileged=false container in most setups. Privileged
+# avoids a long tail of cgroup/permission issues; this is a lab cluster on a
+# trusted network, and the trade is deliberate.
+lxc_unprivileged: false
+
+# --- VM specifics (ignored when node_type: lxc) -----------------------------
+vm_image: "debian-12-genericcloud-amd64.qcow2"
+vm_image_url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+
+# --- k3s --------------------------------------------------------------------
+k3s_version: "v1.31.4+k3s1"
+
+# Disable the bundled ingress/LB only if you intend to bring your own.
+# Traefik is left ON here because the OpenDDIL chart's ingress expects an
+# ingress controller to exist.
+k3s_disable: []
+
+# Extra server args. --write-kubeconfig-mode is what lets the playbook fetch
+# a usable kubeconfig without root gymnastics.
+k3s_server_args: "--write-kubeconfig-mode 644"
+
+# LXC-only: overlayfs inside a container is the most common k3s-in-LXC
+# failure. If containerd will not start, set this to "native".
+# Leave empty to use the default snapshotter.
+k3s_snapshotter: ""
+
+# --- SSH --------------------------------------------------------------------
+ssh_public_key: "ssh-ed25519 AAAA... you@workstation"
+ansible_user: root
+
+# --- SECRETS: use vault or env injection. Never plaintext in a real file. ---
+# Pattern A — ansible-vault (recommended):
+#   ansible-vault encrypt_string 's3cr3t' --name 'proxmox_api_token_secret'
+# and paste the resulting block here.
+#
+# Pattern B — environment injection:
+#   export PROXMOX_TOKEN=...
+#   and leave the lookup below.
+proxmox_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN') }}"
+
+# --- Rancher (optional) -----------------------------------------------------
+# IMPORT the new cluster as a DOWNSTREAM managed cluster. These playbooks
+# never touch the existing Rancher local/management cluster — running
+# workloads on it is a named anti-pattern, and this stack (multiple brokers,
+# Restate instances and Postgres) is exactly the tenant that degrades it.
+#
+# Leave rancher_import_url empty to skip the import entirely.
+rancher_import_url: ""    # the `kubectl apply -f <url>` shown by Rancher's
+                          # "Import Existing Cluster" flow

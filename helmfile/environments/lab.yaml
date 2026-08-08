@@ -1,0 +1,52 @@
+# =============================================================================
+# lab environment — properties of THE CLUSTER, not of any project
+# =============================================================================
+# The distinction is the whole layer boundary in one file:
+#
+#   BELONGS HERE — where the charts are, which context to target, and
+#   cluster-shaped facts a project cannot know (does this cluster have a
+#   default StorageClass? how many nodes?).
+#
+#   DOES NOT BELONG HERE — tier topology, asset config, service tuning,
+#   anything describing what a project deploys rather than where.
+#
+# If you find yourself adding a key that would be identical on every cluster,
+# it is project configuration and belongs in the project's own values file.
+# =============================================================================
+
+# k3s writes context 'default'; ansible/k3s.yml rewrites it to 'edgy-lab'
+# so a stray kubeconfig cannot silently target the wrong cluster.
+kubeContext: edgy-lab
+
+openddil:
+  enabled: true
+  namespace: openddil
+  # Sibling checkout. Adjust to your layout, or switch to an oci:// ref once
+  # the chart is published.
+  chartPath: ../../openddil/openddil-helm/openddil-demo
+  # THE REFERENCE, not a copy. This is the sample overlay's
+  # deployment-manifests fixture — the same file the chart's acceptance tests
+  # render against, so deploying the lab exercises the fixture for real.
+  valuesPath: ../../openddil/openddil-customer-bundle-example/k8s/tier-node-values.yaml
+  overrides:
+    # Cluster-shaped only. k3s ships local-path as the default StorageClass,
+    # so real PVCs work here and emptyDir is unnecessary — unlike the
+    # fixture's defaults, which assume nothing about the cluster.
+    tierNode:
+      postgres:
+        useEmptyDir: false
+        storageClass: local-path
+      restate:
+        useEmptyDir: false
+    persistence:
+      redpandaUseEmptyDir: false
+      restateUseEmptyDir: false
+
+iagent:
+  # Off until the chart path is confirmed. Present so the second consumer is
+  # structural rather than hypothetical — the boundary is easier to hold when
+  # there are visibly two tenants.
+  enabled: false
+  namespace: iagent
+  chartPath: ../../invincible-agent/helm/invincible-agent
+  valuesPath: ../../invincible-agent/helm/invincible-agent/values.yaml

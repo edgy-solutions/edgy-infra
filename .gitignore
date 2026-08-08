@@ -1,0 +1,50 @@
+# =============================================================================
+# Secrets and environment specifics — NEVER commit these.
+# =============================================================================
+# This repo touches hypervisor credentials, so the rule is absolute: every
+# secret-bearing or site-specific file has a committed `.example` twin, and
+# the real one lives only on disk.
+
+# Real inventory — node addresses, hostnames
+ansible/inventory.yml
+ansible/inventory.yaml
+ansible/inventory/*.yml
+!ansible/inventory.example.yml
+
+# Real group_vars — Proxmox API tokens, SSH keys, Rancher tokens
+ansible/group_vars/all.yml
+ansible/group_vars/*.yml
+!ansible/group_vars/*.example.yml
+
+# Vault password files
+.vault-pass
+.vault_pass
+*.vaultpass
+
+# Cluster credentials
+kubeconfig
+*.kubeconfig
+ansible/kubeconfig
+**/kubeconfig
+
+# SSH material
+*.pem
+id_rsa*
+id_ed25519*
+
+# Helmfile local state
+helmfile/environments/*.local.yaml
+.helmfile/
+helmfile.lock
+
+# Ansible runtime
+*.retry
+.ansible/
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

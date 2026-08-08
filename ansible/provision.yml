@@ -1,0 +1,155 @@
+---
+# =============================================================================
+# provision.yml — create the cluster's nodes on Proxmox
+# =============================================================================
+# Creates one container (or VM) per inventory host in k3s_cluster. Runs
+# against localhost using the Proxmox API — the target nodes do not exist yet,
+# which is why every task is delegated rather than run over SSH.
+#
+# NEVER TOUCHES the existing Rancher management cluster. This playbook only
+# creates VMIDs it is explicitly told about in inventory, so its blast radius
+# on existing infrastructure is zero by construction.
+#
+# Idempotent: re-running against existing containers is a no-op.
+#
+# UNVERIFIED against a real Proxmox host — see README §Verification status.
+# The two things most likely to need adjustment are storage/bridge names and
+# template availability, both of which are checked explicitly below rather
+# than assumed.
+# =============================================================================
+
+- name: Provision k3s nodes on Proxmox
+  hosts: k3s_cluster
+  gather_facts: false
+  connection: local
+
+  tasks:
+    # -------------------------------------------------------------------
+    # Fail early and specifically. A wrong template name surfaces as a
+    # confusing API error three tasks later otherwise.
+    # -------------------------------------------------------------------
+    - name: Verify node_type is a supported value
+      ansible.builtin.assert:
+        that: node_type in ['lxc', 'vm']
+        fail_msg: >-
+          node_type must be 'lxc' or 'vm' (got '{{ node_type }}').
+          See group_vars/all.yml.
+      run_once: true
+
+    - name: Verify arch is a supported value
+      ansible.builtin.assert:
+        that: arch in ['amd64', 'arm64']
+        fail_msg: >-
+          arch must be 'amd64' or 'arm64' (got '{{ arch }}').
+      run_once: true
+
+    # -------------------------------------------------------------------
+    # LXC path
+    # -------------------------------------------------------------------
+    - name: Create LXC container
+      when: node_type == 'lxc'
+      community.general.proxmox:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ pve_node }}"
+        vmid: "{{ vmid }}"
+        hostname: "{{ inventory_hostname }}"
+        ostemplate: "{{ proxmox_template_storage }}:vztmpl/{{ lxc_template }}"
+        storage: "{{ proxmox_storage }}"
+        cores: "{{ cores }}"
+        memory: "{{ memory }}"
+        disk: "{{ disk }}"
+        netif:
+          net0: "name=eth0,gw={{ gateway }},ip={{ ip }},bridge={{ proxmox_bridge }}"
+        # unprivileged=false avoids a long tail of cgroup/permission issues
+        # for k3s. Deliberate trade on a lab cluster (see group_vars).
+        unprivileged: "{{ lxc_unprivileged }}"
+        onboot: true
+        # THE LOAD-BEARING LINE for k3s-in-LXC. nesting lets containers run
+        # inside the container; keyctl is required by containerd. Without
+        # both, k3s fails in ways that look like unrelated kernel errors.
+        features:
+          - nesting=1
+          - keyctl=1
+        pubkey: "{{ ssh_public_key }}"
+        state: present
+      register: lxc_create
+
+    # Raw lxc.* options the module does not expose. Written directly to the
+    # container config on the Proxmox host.
+    #
+    # AppArmor confinement blocks containerd's mount operations; dropping the
+    # profile is the standard k3s-in-LXC remedy. This is why the README calls
+    # this the most Proxmox-version-sensitive part of the repo.
+    - name: Apply raw LXC options required by k3s
+      when: node_type == 'lxc'
+      delegate_to: "{{ proxmox_api_host }}"
+      ansible.builtin.blockinfile:
+        path: "/etc/pve/lxc/{{ vmid }}.conf"
+        marker: "# {mark} MANAGED BY edgy-infra (k3s requirements)"
+        block: |
+          lxc.apparmor.profile: unconfined
+          lxc.cgroup2.devices.allow: a
+          lxc.cap.drop:
+          lxc.mount.auto: "proc:rw sys:rw"
+        create: false
+
+    - name: Start LXC container
+      when: node_type == 'lxc'
+      community.general.proxmox:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ pve_node }}"
+        vmid: "{{ vmid }}"
+        state: started
+
+    # -------------------------------------------------------------------
+    # VM path — the escape hatch. No tuning needed anywhere; k3s on a VM
+    # behaves like k3s on metal.
+    # -------------------------------------------------------------------
+    - name: Create VM from cloud image
+      when: node_type == 'vm'
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ pve_node }}"
+        vmid: "{{ vmid }}"
+        name: "{{ inventory_hostname }}"
+        cores: "{{ cores }}"
+        memory: "{{ memory }}"
+        net:
+          net0: "virtio,bridge={{ proxmox_bridge }}"
+        ipconfig:
+          ipconfig0: "ip={{ ip }},gw={{ gateway }}"
+        sshkeys: "{{ ssh_public_key }}"
+        ciuser: "{{ ansible_user }}"
+        onboot: true
+        state: present
+
+    - name: Start VM
+      when: node_type == 'vm'
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ pve_node }}"
+        vmid: "{{ vmid }}"
+        state: started
+
+    # -------------------------------------------------------------------
+    # Confirm the END STATE, not the return code. A playbook that ran is
+    # not a node that works (README §Discipline).
+    # -------------------------------------------------------------------
+    - name: Wait for SSH to answer
+      ansible.builtin.wait_for:
+        host: "{{ ip | regex_replace('/.*$', '') }}"
+        port: 22
+        timeout: 300
+        delay: 5

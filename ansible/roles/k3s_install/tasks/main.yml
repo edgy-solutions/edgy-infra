@@ -1,0 +1,97 @@
+---
+# =============================================================================
+# k3s_install — install the k3s server or an agent
+# =============================================================================
+# Role behaviour keys off group membership: hosts in k3s_server become the
+# control plane; everything else joins as an agent.
+#
+# Arch is a first-class variable. The k3s installer resolves the correct
+# binary from INSTALL_K3S_EXEC/uname, but INSTALL_K3S_BIN_DIR and the
+# arch-specific channel are passed explicitly so an arm64 edge-cluster
+# rebuild uses this same role with `arch: arm64` and nothing else changed.
+# =============================================================================
+
+- name: Set derived facts
+  ansible.builtin.set_fact:
+    k3s_is_server: "{{ inventory_hostname in groups['k3s_server'] }}"
+    k3s_server_host: "{{ hostvars[groups['k3s_server'][0]]['ip'] | regex_replace('/.*$', '') }}"
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+- name: Install k3s server
+  when: k3s_is_server
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_VERSION="{{ k3s_version }}" \
+      INSTALL_K3S_EXEC="server {{ k3s_server_args }} {{ k3s_disable | map('regex_replace', '^', '--disable ') | join(' ') }} {{ ('--snapshotter=' + k3s_snapshotter) if k3s_snapshotter else '' }}" \
+      sh -
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/k3s
+  register: k3s_server_install
+
+- name: Wait for the server API to answer
+  when: k3s_is_server
+  ansible.builtin.wait_for:
+    port: 6443
+    host: "{{ ip | regex_replace('/.*$', '') }}"
+    timeout: 300
+
+# The join token. Read from the server and stashed as a fact so agents can
+# use it without it ever touching disk on the control node or entering git.
+- name: Read node token from server
+  when: k3s_is_server
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: k3s_token_raw
+  no_log: true
+
+- name: Publish token as a fact
+  when: k3s_is_server
+  ansible.builtin.set_fact:
+    k3s_node_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+- name: Install k3s agent
+  when: not k3s_is_server
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_VERSION="{{ k3s_version }}" \
+      K3S_URL="https://{{ k3s_server_host }}:6443" \
+      K3S_TOKEN="{{ hostvars[groups['k3s_server'][0]]['k3s_node_token'] }}" \
+      INSTALL_K3S_EXEC="agent {{ ('--snapshotter=' + k3s_snapshotter) if k3s_snapshotter else '' }}" \
+      sh -
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/k3s
+  no_log: true      # the token is on this command line
+
+# ---------------------------------------------------------------------------
+# End-state check. Ansible's characteristic failure is exit-zero-but-wrong,
+# and the k3s installer is a shell script that happily returns 0 while the
+# service dies seconds later. Assert the service is actually up.
+# ---------------------------------------------------------------------------
+- name: Confirm the k3s service is running
+  ansible.builtin.systemd:
+    name: "{{ 'k3s' if k3s_is_server else 'k3s-agent' }}"
+  register: k3s_svc
+  retries: 12
+  delay: 10
+  until: k3s_svc.status.ActiveState == 'active'
+
+- name: Fail clearly if the service did not stay up
+  ansible.builtin.assert:
+    that: k3s_svc.status.ActiveState == 'active'
+    fail_msg: >-
+      {{ 'k3s' if k3s_is_server else 'k3s-agent' }} is not active on
+      {{ inventory_hostname }}. On LXC the usual cause is containerd failing
+      on /dev/kmsg or the overlayfs snapshotter — check
+      `journalctl -u {{ 'k3s' if k3s_is_server else 'k3s-agent' }}`. If it is
+      the snapshotter, set k3s_snapshotter: native in group_vars. If it keeps
+      fighting, set node_type: vm and re-run provision.yml.

@@ -1,0 +1,74 @@
+# =============================================================================
+# helmfile — the deploy HARNESS
+# =============================================================================
+# THE LAYER BOUNDARY, restated because this file is where it gets violated:
+#
+#   This repo owns the harness. It does NOT own any project's charts, values,
+#   or topology. Those live in their own repositories and are referenced here
+#   by PATH — never copied in.
+#
+#   The test: if editing this file requires knowing what OpenDDIL's tier
+#   topology looks like, the boundary has been crossed. Values belong in the
+#   project; this file says WHERE to find them and WHICH cluster to send them
+#   to.
+#
+# Copying a project's values here would make this repo a second home for that
+# project's deployment truth — which then drifts from the project's own copy.
+# That is the two-truths pattern with an innocent-looking cause.
+#
+# WHY HELMFILE AT ALL: the OpenDDIL chart carries ~650 lines of values and
+# gets deployed to more than one place. helmfile composes environments rather
+# than maintaining parallel `-f` invocations that drift, and when
+# multi-cluster arrives it targets a kubeContext per release — which is the
+# actual shape of that problem.
+# =============================================================================
+
+environments:
+  lab:
+    values:
+      - environments/lab.yaml
+  # Add further environments as siblings. Each supplies paths and cluster
+  # context; none supplies project topology.
+
+---
+
+repositories: []
+# Charts are consumed from local paths today (sibling checkouts). When the
+# charts are published as OCI artifacts, add the registry here and switch the
+# `chart:` fields below to oci:// references — no other change required.
+
+releases:
+  # ---------------------------------------------------------------------------
+  # OpenDDIL — chart and values BOTH come from the OpenDDIL side.
+  # ---------------------------------------------------------------------------
+  - name: openddil
+    namespace: {{ .Values.openddil.namespace }}
+    createNamespace: true
+    chart: {{ .Values.openddil.chartPath }}
+    installed: {{ .Values.openddil.enabled }}
+    kubeContext: {{ .Values.kubeContext }}
+    values:
+      # Referenced, not inlined. This file points at the sample overlay's
+      # deployment-manifests class — the same fixture the chart's own
+      # acceptance tests render against. Deploying the lab therefore
+      # EXERCISES that fixture for real, which means the overlay's parity
+      # check starts guarding deployment truth rather than file presence.
+      - {{ .Values.openddil.valuesPath }}
+      # Environment-local overrides (node counts, storage classes) live in
+      # the environment file, which is a property of the CLUSTER, not of the
+      # project — so it is legitimately ours.
+      - {{ toYaml .Values.openddil.overrides | nindent 8 }}
+
+  # ---------------------------------------------------------------------------
+  # Invincible Agent — same shape, same boundary. Disabled until its chart
+  # path is configured; present so the second consumer is structural rather
+  # than hypothetical.
+  # ---------------------------------------------------------------------------
+  - name: iagent
+    namespace: {{ .Values.iagent.namespace }}
+    createNamespace: true
+    chart: {{ .Values.iagent.chartPath }}
+    installed: {{ .Values.iagent.enabled }}
+    kubeContext: {{ .Values.kubeContext }}
+    values:
+      - {{ .Values.iagent.valuesPath }}

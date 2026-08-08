@@ -1,0 +1,89 @@
+# =============================================================================
+# Inventory — COPY TO inventory.yml AND EDIT. The real one is gitignored.
+# =============================================================================
+# Cluster shape mirrors the existing edge cluster's pattern: 1 k3s server +
+# 4 agents across 4 live Proxmox nodes, with the SERVER COLOCATED alongside
+# one agent on the same physical node.
+#
+# Why single-server rather than HA embedded etcd: with one server, the fifth
+# Proxmox node returning from repair is simply "+1 agent". With a 3-node etcd
+# quorum, its return changes the quorum math. This is a test cluster whose
+# rebuild is one playbook run — an HA control plane buys overhead and nothing
+# else here.
+#
+# ADDING THE FIFTH NODE LATER: add a k3s_agents entry with pve_node: pve-5.
+# Nothing else changes.
+# =============================================================================
+
+all:
+  vars:
+    # Proxmox API endpoint. Token auth only — no passwords in inventory.
+    # The token secret itself lives in group_vars/all.yml (also gitignored).
+    proxmox_api_host: "pve-1.lab.example"
+    proxmox_api_user: "ansible@pve"
+    proxmox_api_token_id: "automation"
+
+    # Substrate defaults. Verify against YOUR Proxmox — these are the
+    # common defaults, not a guarantee.
+    proxmox_storage: "local-lvm"        # where container/VM disks land
+    proxmox_template_storage: "local"   # where LXC templates are kept
+    proxmox_bridge: "vmbr0"
+
+  children:
+    # -----------------------------------------------------------------------
+    # k3s server — the control plane. Colocated with agent-1 on pve-1.
+    # -----------------------------------------------------------------------
+    k3s_server:
+      hosts:
+        k3s-server-1:
+          vmid: 9001
+          pve_node: pve-1
+          ip: "192.168.1.101/24"
+          gateway: "192.168.1.1"
+          cores: 4
+          memory: 8192
+          disk: 40
+
+    # -----------------------------------------------------------------------
+    # k3s agents — one per live Proxmox node, plus the colocated one.
+    # -----------------------------------------------------------------------
+    k3s_agents:
+      hosts:
+        k3s-agent-1:
+          vmid: 9011
+          pve_node: pve-1        # colocated with the server
+          ip: "192.168.1.111/24"
+          gateway: "192.168.1.1"
+          cores: 6
+          memory: 16384
+          disk: 80
+        k3s-agent-2:
+          vmid: 9012
+          pve_node: pve-2
+          ip: "192.168.1.112/24"
+          gateway: "192.168.1.1"
+          cores: 6
+          memory: 16384
+          disk: 80
+        k3s-agent-3:
+          vmid: 9013
+          pve_node: pve-3
+          ip: "192.168.1.113/24"
+          gateway: "192.168.1.1"
+          cores: 6
+          memory: 16384
+          disk: 80
+        k3s-agent-4:
+          vmid: 9014
+          pve_node: pve-4
+          ip: "192.168.1.114/24"
+          gateway: "192.168.1.1"
+          cores: 6
+          memory: 16384
+          disk: 80
+
+    # Convenience group: everything that gets provisioned and prepped.
+    k3s_cluster:
+      children:
+        k3s_server:
+        k3s_agents:

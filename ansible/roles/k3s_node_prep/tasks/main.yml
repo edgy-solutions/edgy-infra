@@ -1,0 +1,143 @@
+---
+# =============================================================================
+# k3s_node_prep — make a node capable of running k3s
+# =============================================================================
+# On VMs this is nearly a no-op: k3s on a VM behaves like k3s on metal.
+#
+# On LXC it is the load-bearing role in this repo, and the most
+# Proxmox-version-sensitive code here. Every task below exists because k3s
+# fails without it, usually with an error that points somewhere unhelpful.
+#
+# IF THIS ROLE IS FIGHTING YOU: set node_type: vm in group_vars and re-run
+# provision.yml. That is the designed escape, not a defeat — on a cluster
+# whose purpose is validating someone else's chart, runtime debugging is
+# contamination.
+# =============================================================================
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ca-certificates
+      - iptables
+      - nfs-common          # some charts want RWX volumes
+    state: present
+    update_cache: true
+  retries: 3
+  delay: 5
+
+# ---------------------------------------------------------------------------
+# Universal: kubelet will refuse to start with swap enabled.
+# ---------------------------------------------------------------------------
+- name: Disable swap now
+  ansible.builtin.command: swapoff -a
+  changed_when: false
+  failed_when: false     # containers often have no swap to disable
+
+- name: Disable swap across reboots
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\sswap\s.*)$'
+    replace: '# \1'
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# LXC-ONLY from here down.
+# ---------------------------------------------------------------------------
+
+# k3s/containerd write to /dev/kmsg. Containers do not have it, and the
+# failure is opaque: containerd exits early with a message about the kernel
+# log rather than about a missing device. Symlinking to /dev/console is the
+# standard remedy; the systemd unit re-creates it on every boot because
+# /dev is tmpfs.
+- name: Create /dev/kmsg shim (LXC)
+  when: node_type == 'lxc'
+  ansible.builtin.copy:
+    dest: /usr/local/bin/kmsg-shim.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # k3s/containerd expect /dev/kmsg. LXC does not provide it.
+      [ -e /dev/kmsg ] || ln -s /dev/console /dev/kmsg
+      exit 0
+
+- name: Install kmsg shim unit (LXC)
+  when: node_type == 'lxc'
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/kmsg-shim.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Provide /dev/kmsg for containerd (LXC workaround)
+      DefaultDependencies=no
+      Before=k3s.service k3s-agent.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kmsg-shim.sh
+      [Install]
+      WantedBy=sysinit.target
+
+- name: Enable kmsg shim (LXC)
+  when: node_type == 'lxc'
+  ansible.builtin.systemd:
+    name: kmsg-shim.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Networking modules. In LXC these are loaded on the HOST — a container
+# cannot modprobe. Loading is attempted anyway for the VM case and allowed
+# to fail silently in containers, where the host has already provided them.
+- name: Load kernel modules for k3s networking
+  ansible.builtin.command: "modprobe {{ item }}"
+  loop:
+    - overlay
+    - br_netfilter
+  changed_when: false
+  failed_when: false
+
+- name: Persist module list
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k3s.conf
+    mode: "0644"
+    content: |
+      overlay
+      br_netfilter
+  failed_when: false
+
+- name: Apply sysctls for bridged traffic and forwarding
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    reload: true
+    state: present
+  loop:
+    - { name: net.bridge.bridge-nf-call-iptables,  value: "1" }
+    - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+    - { name: net.ipv4.ip_forward,                 value: "1" }
+  # In an unprivileged container these are host-owned and read-only. Not
+  # fatal — the host already has them set — so a failure here is reported
+  # but does not stop the run.
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# End-state verification. A playbook that ran is not a node that works
+# (README §Discipline) — so assert the thing k3s actually needs, rather
+# than trusting that the tasks above returned zero.
+# ---------------------------------------------------------------------------
+- name: Verify /dev/kmsg exists (the most common LXC failure)
+  ansible.builtin.stat:
+    path: /dev/kmsg
+  register: kmsg_check
+
+- name: Fail clearly if the kmsg shim did not take
+  ansible.builtin.assert:
+    that: kmsg_check.stat.exists
+    fail_msg: >-
+      /dev/kmsg is missing on {{ inventory_hostname }}. containerd will fail
+      to start with an error that does NOT mention kmsg. Check that the
+      container has nesting=1 and an unconfined AppArmor profile
+      (provision.yml writes both). If this persists, set node_type: vm in
+      group_vars and re-run provision.yml — that is the designed escape.

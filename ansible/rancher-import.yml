@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# rancher-import.yml — register this cluster as a Rancher DOWNSTREAM cluster
+# =============================================================================
+# IMPORT, NEVER JOIN.
+#
+# There is an existing Rancher management ("local") cluster on this Proxmox.
+# This playbook does not touch it, and neither does anything else in this
+# repo. It only applies a manifest to the NEW cluster, which then reaches out
+# and registers itself with Rancher.
+#
+# Why this shape rather than deploying onto Rancher's local cluster: the local
+# cluster is the management plane. Running workloads on it is a named
+# anti-pattern, and this stack — multiple brokers, multiple Restate
+# instances, multiple Postgres — is precisely the tenant that degrades it.
+#
+# Two bonuses fall out: blast radius on existing infrastructure is zero, and
+# the lab ends up mirroring how Rancher is normally run in production
+# (a management plane governing downstream clusters), so the management
+# topology gets rehearsed too.
+#
+# OPTIONAL. Leave rancher_import_url empty in group_vars to skip.
+# =============================================================================
+
+- name: Import the new cluster into Rancher as a downstream cluster
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  tasks:
+    - name: Skip cleanly when no import URL is configured
+      when: rancher_import_url | length == 0
+      ansible.builtin.meta: end_play
+
+    - name: Confirm the kubeconfig points at the NEW cluster, not Rancher's
+      ansible.builtin.command: >-
+        kubectl --kubeconfig {{ playbook_dir }}/kubeconfig
+        config current-context
+      register: ctx
+      changed_when: false
+
+    # Guard rail, deliberately blunt. The whole value of this playbook is
+    # that it never touches the management plane, so it refuses to run
+    # against a context named 'local' — Rancher's own cluster.
+    - name: Refuse to run against a Rancher local cluster
+      ansible.builtin.assert:
+        that: ctx.stdout | trim != 'local'
+        fail_msg: >-
+          kubeconfig context is 'local', which is Rancher's own management
+          cluster. This playbook imports a DOWNSTREAM cluster and must never
+          be pointed at the management plane. Check
+          {{ playbook_dir }}/kubeconfig.
+
+    - name: Apply the Rancher registration manifest
+      ansible.builtin.command: >-
+        kubectl --kubeconfig {{ playbook_dir }}/kubeconfig
+        apply -f {{ rancher_import_url }}
+      register: import_apply
+      changed_when: "'created' in import_apply.stdout or 'configured' in import_apply.stdout"
+
+    - name: Wait for the cattle-cluster-agent to come up
+      ansible.builtin.command: >-
+        kubectl --kubeconfig {{ playbook_dir }}/kubeconfig
+        -n cattle-system get deploy cattle-cluster-agent
+        -o jsonpath={.status.readyReplicas}
+      register: agent_ready
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: agent_ready.stdout | default('0') | int > 0
+      failed_when: false
+
+    - name: Report import status honestly
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Cluster registered — it should appear as Active in the Rancher UI.'
+             if (agent_ready.stdout | default('0') | int) > 0
+             else 'Manifest applied but cattle-cluster-agent is not Ready yet.
+                   This is usually Rancher URL reachability or certificate
+                   trust from the new cluster. Check:
+                   kubectl -n cattle-system logs deploy/cattle-cluster-agent' }}

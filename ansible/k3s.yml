@@ -1,0 +1,85 @@
+---
+# =============================================================================
+# k3s.yml — prep the nodes, form the cluster, fetch a usable kubeconfig
+# =============================================================================
+# Order matters and is enforced by play separation rather than by hope:
+# every node is prepped before the server installs, and the server is fully
+# up before any agent tries to join.
+#
+# Run after provision.yml.
+# =============================================================================
+
+- name: Prepare all nodes
+  hosts: k3s_cluster
+  gather_facts: true
+  roles:
+    - k3s_node_prep
+
+- name: Install the k3s server
+  hosts: k3s_server
+  gather_facts: false
+  roles:
+    - k3s_install
+
+- name: Join the agents
+  hosts: k3s_agents
+  gather_facts: false
+  # Serial so a failure surfaces on one node instead of four simultaneously
+  # — verify before multiplying (README §Discipline).
+  serial: 1
+  roles:
+    - k3s_install
+
+- name: Fetch kubeconfig and verify the cluster
+  hosts: k3s_server
+  gather_facts: false
+  tasks:
+    - name: Read kubeconfig from the server
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_raw
+
+    - name: Write kubeconfig locally, pointed at the server's real address
+      delegate_to: localhost
+      ansible.builtin.copy:
+        # k3s writes 127.0.0.1 into its kubeconfig, which is correct on the
+        # server and useless anywhere else. Rewrite to the routable address.
+        content: >-
+          {{ kubeconfig_raw.content | b64decode
+             | replace('127.0.0.1', ip | regex_replace('/.*$', ''))
+             | replace('default', 'edgy-lab') }}
+        dest: "{{ playbook_dir }}/kubeconfig"
+        mode: "0600"
+
+    # ---------------------------------------------------------------------
+    # End-state verification. The playbooks returning zero proves they ran;
+    # this proves a cluster exists. Node COUNT is asserted because a silently
+    # unjoined agent is the failure this catches — everything looks fine
+    # until a workload will not schedule.
+    # ---------------------------------------------------------------------
+    - name: Count Ready nodes
+      delegate_to: localhost
+      ansible.builtin.command: >-
+        kubectl --kubeconfig {{ playbook_dir }}/kubeconfig
+        get nodes --no-headers
+      register: node_list
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: node_list.rc == 0
+
+    - name: Assert every inventory node joined
+      delegate_to: localhost
+      ansible.builtin.assert:
+        that:
+          - node_list.stdout_lines | length == groups['k3s_cluster'] | length
+          - "'NotReady' not in node_list.stdout"
+        fail_msg: >-
+          Expected {{ groups['k3s_cluster'] | length }} Ready nodes, saw
+          {{ node_list.stdout_lines | length }}:
+          {{ node_list.stdout }}
+          A missing agent usually means the join token or the server address
+          was wrong; check `journalctl -u k3s-agent` on the absent node.
+        success_msg: >-
+          Cluster up: {{ node_list.stdout_lines | length }} nodes Ready.
+          export KUBECONFIG={{ playbook_dir }}/kubeconfig
