@@ -29,6 +29,25 @@ openddil:
   # render against, so deploying the lab exercises the fixture for real.
   valuesPath: ../../openddil/openddil-customer-bundle-example/k8s/tier-node-values.yaml
   overrides:
+    # WHERE this cluster serves from — a property of the cluster's DNS and
+    # ingress controller, not of OpenDDIL's topology, so it belongs here
+    # rather than in the project's values.
+    #
+    # k3s ships traefik and publishes it as a LoadBalancer on every node
+    # (192.168.1.230-234), so the DNS record should point at one of those —
+    # or all five for crude round-robin.
+    #
+    # TLS: no cert-manager on this cluster, so traefik terminates HTTPS with
+    # its own self-signed default certificate. https:// works; browsers will
+    # warn. Add cert-manager and a `tls:` block here when a real certificate
+    # is wanted — deliberately NOT faked with a hand-rolled secret, because a
+    # self-signed cert that claims to be valid is worse than one that admits
+    # it isn't.
+    ingress:
+      enabled: true
+      className: traefik
+      host: openddil.cortex.edgy-solutions.com
+
     # Cluster-shaped only. k3s ships local-path as the default StorageClass,
     # so real PVCs work here and emptyDir is unnecessary — unlike the
     # fixture's defaults, which assume nothing about the cluster.
