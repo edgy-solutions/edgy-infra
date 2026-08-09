@@ -38,21 +38,81 @@ itself — a two-truths incubator with an innocent name.
 
 ---
 
-## ⚠ Verification status
+## Verification status
 
-**Not yet run against a real Proxmox host.** Authored from module and API
-contracts, not from a successful run. Treat the first execution as a
-debugging session.
+**Verified 2026-08-08 against a real, mixed-version Proxmox cluster.**
+Five LXC nodes spanning PVE **8.4.5** and **9.2.2** in a single cluster;
+k3s v1.31.4, 5/5 Ready; traefik, local-path and metrics-server healthy.
+Both playbooks re-run at `changed=0, failed=0` — idempotence demonstrated,
+not asserted.
 
-Most likely to need adjustment:
+The scaffold was authored from module and API contracts rather than from a
+successful run, and essentially every assumption in it was wrong in some
+specific way. The findings below are recorded because each is cheap to hit
+again and expensive to diagnose from its error message: in most cases the
+message names something other than the actual cause.
 
-1. **LXC + k3s tuning** (`roles/k3s_node_prep`) — nesting / keyctl /
-   AppArmor / `/dev/kmsg` / snapshotter. Well-documented but
-   Proxmox-version sensitive. This is exactly why `node_type: vm` exists
-   as a one-variable escape.
-2. **Storage and bridge names** — `local-lvm` / `vmbr0` are defaults.
-3. **Template presence** — the playbook checks and prints the download
-   command rather than guessing.
+### The nine first-run findings
+
+| # | Symptom | Actual cause |
+|---|---------|--------------|
+| 1 | `couldn't resolve module/action community.general.proxmox` | The Proxmox modules **moved to `community.proxmox`**; `community.general` 13.x ships none of them. Installing `community.general` succeeds and the module is still gone. |
+| 2 | `Failed to import the required Python library (proxmoxer)` | Ansible's `auto` interpreter discovery prefers the newest python on `PATH`, so modules ran under a uv-managed 3.12 while proxmoxer sat in the system 3.10. **The library was already installed.** Pin `ansible_python_interpreter`. |
+| 3 | `CERTIFICATE_VERIFY_FAILED` | Proxmox ships a self-signed certificate. Now the explicit `proxmox_validate_certs` variable. |
+| 4 | `500: Only root can pass arbitrary filesystem paths` | Not a privilege problem at all. Modern PVE **enforces `<STORAGE>:<SIZE>`**, so a bare size is parsed as a filesystem path. Use structured `disk_volume`. |
+| 5 | `403: Permission check failed (/, Sys.Modify)` | Setting `nameserver` at create time demands `Sys.Modify` on `/`. Omit it — Proxmox then inherits the host's resolver, which is what you wanted. |
+| 6 | `403: changing feature flags (except nesting) is only allowed for root@pam` | An API token may set **`nesting` and nothing else**, at any ACL level. See *the permission ceiling* below — this one has consequences. |
+| 7 | `ENOENT` on an absolute path that demonstrably exists | `delegate_to` **inherits the play's `connection: local`**, so the task ran on the control node. Override `ansible_connection` on each delegated task. |
+| 8 | `Path /etc/pve/lxc/<vmid>.conf does not exist` — for containers that do exist | `/etc/pve/lxc` is a **symlink to the local node's** directory. `/etc/pve` is replicated; that path is not. Use `/etc/pve/nodes/<node>/lxc`. |
+| 9 | Raw `lxc.*` options duplicating on every run | `blockinfile` is wrong for `/etc/pve`. Proxmox re-emits the file and hoists `#` lines into the container *description*, detaching markers from the lines they bracket. Replaced with a deterministic rewrite that converges from an already-duplicated file. |
+
+And one that appears only on the **second** run: `community.proxmox`'s
+`update` default flipped to `true` in 1.0.0, and the update path is broken in
+2.0.0 (`cmode` defaults to the sentinel `default`, which is not in the API
+enum). Run 1 passes, run 2 fails — the worst shape for a bug, because it
+looks like the first run broke something. `update: false` is what makes
+re-runs safe, at the documented cost that inventory size changes are not
+applied by re-running.
+
+### The permission ceiling, and why it improved the result
+
+Finding #6 is load-bearing. An API token cannot create a privileged
+container and cannot set any feature flag except `nesting`; no ACL grant
+lifts either, because it is a rule about *who you are*, not what you hold.
+That forced, in order:
+
+- **`keyctl` applied over root SSH** rather than through the token, then
+- **unprivileged containers**, which in turn forced
+- **`KubeletInUserNamespace`** — kubelet writes global kernel tunables at
+  startup (`vm/overcommit_memory`, `kernel/panic`, `kernel/panic_on_oops`)
+  which a user namespace cannot write, and without the gate it crash-loops
+  in `activating` rather than failing outright.
+
+This is a **better** outcome than the plan. Most k3s-in-LXC recipes reach for
+privileged containers to dodge a long tail of cgroup issues; the permission
+model refused, and the cluster runs at a stricter isolation level with the
+same functionality. The root SSH channel ended up used for exactly two things
+— `keyctl` and the raw `lxc.*` options — rather than becoming the general
+path of least resistance.
+
+**Unprivileged + nesting + keyctl + `KubeletInUserNamespace` is the proven
+configuration.** Prefer it for an ARM edge rebuild as well: it is the one
+with evidence behind it, not the privileged fallback everyone expects to
+need. `node_type: vm` remains the escape hatch — but note that flipping
+`lxc_unprivileged` back to `false` is *not* an escape, because that path is
+closed to a token entirely.
+
+### Mixed-version clusters
+
+This cluster runs PVE 8.4.5 and 9.2.2 side by side, which Proxmox tolerates
+during upgrades. Be aware that **the same restriction reports different
+errors per version** — finding #6 surfaced as the explicit feature-flag
+message on 8.4.5 and as a generic `Sys.Modify` denial on 9.2.2, which made
+one problem look like two unrelated ones and cost a diagnostic cycle.
+
+If a failure splits cleanly along node lines and makes no sense, check
+`pvesh get /nodes/<node>/version` before anything else. Long-lived version
+splits accumulate this confusion; resolve them when convenient.
 
 All playbooks are idempotent and safe to re-run.
 
@@ -129,16 +189,105 @@ clusters), so the lab rehearses the real management topology too.
 
 ---
 
+## Prerequisites
+
+Five things must exist before `provision.yml` will get anywhere. Each was a
+real blocker on the first run; none is discoverable from the error you get
+without it.
+
+**1. A Proxmox API token, and the ACL grants it needs.** The token's rights
+are the intersection of the *token's* ACL and the *user's* — granting only
+the token changes nothing if the user lacks the role:
+
+```bash
+# what the playbooks actually need
+pveum acl modify /pool/<pool>            --tokens 'user@pve!id' --roles PVEVMAdmin
+pveum acl modify /storage/local          --tokens 'user@pve!id' --roles PVEDatastoreUser
+pveum acl modify /storage/local-lvm      --tokens 'user@pve!id' --roles PVEDatastoreUser
+pveum acl modify /sdn/zones/localnetwork/<bridge> --tokens 'user@pve!id' --roles PVESDNUser
+
+# read-only visibility — grant to BOTH the token and the user, or it has no effect
+pveum acl modify / --tokens 'user@pve!id' --roles PVEAuditor
+pveum acl modify / --users  'user@pve'    --roles PVEAuditor
+```
+
+**2. The pool must already exist.** An ACL may name a pool that was never
+created; `pool:` then fails at create time.
+
+```bash
+pvesh create /pools --poolid <pool>
+```
+
+**3. The LXC template, on *every* node that will host a container.** `local`
+is node-local storage — a template on the node you run commands from proves
+nothing about the others. `provision.yml` checks per node and prints the
+exact fix, but seeding up front is faster:
+
+```bash
+for n in <node1> <node2> <node3>; do
+  pvesh create /nodes/$n/aplinfo --storage local --template <template>.tar.zst
+done
+```
+
+**4. Root SSH from the control node to one Proxmox node.** Two tasks cannot
+go through the API at all — `keyctl` (root@pam only) and the raw `lxc.*`
+options (not exposed by the API). Both use `pvesh` or `/etc/pve/nodes/...`,
+which reach the whole cluster from a single node, so one host is enough.
+
+```bash
+ssh-keygen -t ed25519 -C edgy-infra-lab      # on the control node
+# then, on the Proxmox host:
+echo '<pubkey>' >> /root/.ssh/authorized_keys
+```
+
+**5. Static IPs from OUTSIDE the DHCP pool.** These nodes take static
+addresses. *"It did not answer a ping"* is **not** evidence an address is
+free — it only means nothing holds a lease right now, and the server can
+hand out that same address tomorrow. Read the pool bounds off the DHCP
+server (OPNsense/pfSense: *Services → DHCPv4 → \[interface\] → Range*) and
+choose from outside it, or reserve static mappings. Cross-check `arp -a`.
+
+---
+
+## What the token deliberately cannot see
+
+The least-privilege token has blind spots. They are the design working, but
+they will mislead you if you use the API to *verify* rather than to act:
+
+- **`GET /pools` returns `{"data":[]}`** without `Pool.Audit` — an empty
+  list, not a 403. A pool that exists reads as absent. `GET /pools/<id>`
+  *does* say `Permission check failed (/pool/<id>, Pool.Audit)`, so query
+  the specific pool when you need a real answer.
+- **A child ACL replaces the inherited one; it does not union with it.**
+  `PVEAuditor` on `/` never reaches `/pool/<pool>` once that path has its own
+  ACL — which is exactly why `Sys.Audit` worked everywhere while `Pool.Audit`
+  was denied on the pool alone.
+- **Node capacity reads as `0`** without `Sys.Audit`: `maxcpu` and `maxmem`
+  come back zero rather than erroring, so a 32-core node looks empty.
+- **`GET /cluster/resources?type=vm` returns an empty list** without
+  `VM.Audit`, so an occupied cluster looks idle.
+
+The pattern is worth internalising: **Proxmox's list endpoints filter to what
+you may audit and return success.** Absence in a list is not evidence of
+absence in the cluster. When a pre-flight check reports "nothing there",
+confirm it against a single-object endpoint that can actually deny you.
+
+---
+
 ## Usage
 
 ```bash
-pip install ansible proxmoxer requests
-ansible-galaxy collection install community.general kubernetes.core
-
+pip install --user ansible-core proxmoxer requests
+# NOTE: community.proxmox, not community.general — the Proxmox modules moved,
+# and community.general 13.x ships none of them.
 cd ansible
+ansible-galaxy collection install -r requirements.yml
+
 cp inventory.example.yml inventory.yml
 cp group_vars/all.example.yml group_vars/all.yml
 # edit both
+
+export PROXMOX_TOKEN='<token secret>'    # never written to a file
 
 ansible-playbook -i inventory.yml provision.yml   # containers/VMs
 ansible-playbook -i inventory.yml k3s.yml         # k3s + kubeconfig
