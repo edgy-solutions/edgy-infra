@@ -13,6 +13,33 @@
 #
 # ADDING THE FIFTH NODE LATER: add a k3s_agents entry with pve_node: pve-5.
 # Nothing else changes.
+#
+# ADDRESSING — PICK STATIC IPs FROM OUTSIDE THE DHCP POOL.
+# These nodes take static addresses, so they must not sit inside the range
+# the DHCP server hands out. "It did not answer a ping" is NOT evidence an
+# address is free — it only means nothing holds a lease at this instant. The
+# server can lease that same address tomorrow and collide with a node that
+# never asked permission.
+#
+# Read the pool bounds off the DHCP server (on OPNsense/pfSense:
+# Services > DHCPv4 > [interface] > Range) and choose addresses outside it,
+# or reserve them as static mappings. Cross-check against `arp -a`.
+#
+# SIZING — MEMORY IS THE BINDING CONSTRAINT, NOT CPU.
+# An LXC's `cores` is a scheduling limit on a shared kernel, so CPU
+# oversubscription across guests is cheap. `memory` is a hard cap and is what
+# actually runs out. Size from the workload's summed pod REQUESTS (what the
+# scheduler must satisfy), not its limits (burst headroom, intentionally
+# oversubscribed), then add ~1 GiB per node for k3s and system pods.
+#
+# Check FREE memory per Proxmox host before placing guests — cluster totals
+# hide the constraint. `pvesh get /nodes` reports maxmem and mem (used); the
+# difference is what you can actually place. One busy host can be the limit
+# while the cluster looks empty.
+#
+# The defaults below (5 x 4 vCPU / 8 GiB = 20 vCPU / 40 GiB) were set from a
+# measured workload needing ~6 vCPU / 13.4 GiB of requests — roughly 2x
+# headroom. Re-measure for yours rather than inheriting these numbers.
 # =============================================================================
 
 all:
@@ -28,6 +55,37 @@ all:
     proxmox_storage: "local-lvm"        # where container/VM disks land
     proxmox_template_storage: "local"   # where LXC templates are kept
     proxmox_bridge: "vmbr0"
+
+    # The Proxmox POOL guests are created into. Not cosmetic: a
+    # least-privilege API token is granted VM.Allocate on /pool/<name>
+    # rather than cluster-wide, so creating outside the pool returns 403.
+    # The pool must already exist — see README prerequisites.
+    proxmox_pool: "edgy-infra"
+
+    # Proxmox ships a SELF-SIGNED certificate. Left true, every API call
+    # fails with CERTIFICATE_VERIFY_FAILED. This is an explicit variable
+    # rather than a hardcoded `false` so that turning verification back on,
+    # once a trusted cert is installed, is a one-line change instead of a
+    # hunt through the playbook.
+    proxmox_validate_certs: false
+
+    # Resolver handed to each node. A static-IP guest has NO DNS without
+    # this, and the resulting failure appears much later as the k3s
+    # installer being unable to reach get.k3s.io.
+    dns_server: "192.168.1.1"
+
+    # PIN THE INTERPRETER — do not rely on `auto` discovery.
+    # Ansible probes PATH and prefers the newest python it finds. If the
+    # control node has a pyenv/uv/conda python earlier in PATH than the
+    # system one, modules execute there while ansible itself runs on the
+    # system python — so a library you definitely installed appears missing.
+    # The error names the library, not the interpreter, which sends you off
+    # reinstalling something that was never absent.
+    ansible_python_interpreter: /usr/bin/python3
+
+    # NOTE: ansible_host is set on the k3s_cluster GROUP below, not here —
+    # under `all` it would also apply to the implicit localhost, which has
+    # no `ip` to render from.
 
   children:
     # -----------------------------------------------------------------------
@@ -54,36 +112,47 @@ all:
           pve_node: pve-1        # colocated with the server
           ip: "192.168.1.111/24"
           gateway: "192.168.1.1"
-          cores: 6
-          memory: 16384
+          cores: 4
+          memory: 8192
           disk: 80
         k3s-agent-2:
           vmid: 9012
           pve_node: pve-2
           ip: "192.168.1.112/24"
           gateway: "192.168.1.1"
-          cores: 6
-          memory: 16384
+          cores: 4
+          memory: 8192
           disk: 80
         k3s-agent-3:
           vmid: 9013
           pve_node: pve-3
           ip: "192.168.1.113/24"
           gateway: "192.168.1.1"
-          cores: 6
-          memory: 16384
+          cores: 4
+          memory: 8192
           disk: 80
         k3s-agent-4:
           vmid: 9014
           pve_node: pve-4
           ip: "192.168.1.114/24"
           gateway: "192.168.1.1"
-          cores: 6
-          memory: 16384
+          cores: 4
+          memory: 8192
           disk: 80
 
     # Convenience group: everything that gets provisioned and prepped.
     k3s_cluster:
+      # Connect by ADDRESS, not by inventory name — these hosts need not be
+      # in DNS. Derived from each host's `ip` so the address is stated once.
+      #
+      # Scoped to this group rather than `all` because `all` also covers the
+      # implicit localhost, which has no `ip`; tasks delegated to localhost
+      # then carry an unrenderable ansible_host.
+      #
+      # provision.yml is `connection: local` and never needs this, so a
+      # missing ansible_host only surfaces at k3s.yml — after the nodes exist.
+      vars:
+        ansible_host: "{{ ip | regex_replace('/.*$', '') }}"
       children:
         k3s_server:
         k3s_agents:

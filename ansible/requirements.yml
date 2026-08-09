@@ -1,0 +1,40 @@
+---
+# =============================================================================
+# Ansible collection requirements
+#   ansible-galaxy collection install -r requirements.yml
+# =============================================================================
+# WHY THIS FILE EXISTS, PINNED, AND EXPLICIT:
+#
+# The Proxmox modules used to live in `community.general`. They no longer do —
+# they were split into `community.proxmox`, and community.general 13.x ships
+# NONE of them. A playbook written against `community.general.proxmox` fails
+# with a module-not-found error whose text says nothing about the relocation,
+# on a control node where `ansible-galaxy collection install community.general`
+# appeared to succeed.
+#
+# Pinning with `>=` rather than exact versions: this is a lab harness that
+# should pick up fixes, and the failure mode above was a MISSING collection,
+# not a version skew.
+# =============================================================================
+
+collections:
+  # Proxmox VE: proxmox (LXC), proxmox_kvm (VM), proxmox_pool.
+  # NOTE: the LXC module spells the resolver option `nameserver` while the KVM
+  # module spells it `nameservers` (a list). Same intent, different vocabulary
+  # — provision.yml sets each correctly.
+  - name: community.proxmox
+    version: ">=2.0.0"
+
+  # kubectl/helm-adjacent modules for post-cluster steps.
+  - name: kubernetes.core
+    version: ">=6.0.0"
+
+  # Still used for general-purpose utility modules.
+  - name: community.general
+    version: ">=13.0.0"
+
+  # sysctl / mount / selinux. NOT bundled with ansible-core, so a playbook
+  # using ansible.posix.sysctl fails at parse time with "couldn't resolve
+  # module/action" — which reads as a typo rather than a missing collection.
+  - name: ansible.posix
+    version: ">=1.5.0"

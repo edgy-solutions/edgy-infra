@@ -26,14 +26,31 @@ arch: amd64
 node_type: lxc
 
 # --- LXC specifics (ignored when node_type: vm) -----------------------------
-# The template must ALREADY exist on proxmox_template_storage. provision.yml
-# checks and prints the download command rather than guessing.
-lxc_template: "debian-12-standard_12.7-1_amd64.tar.zst"
+# The template must ALREADY exist on proxmox_template_storage, ON EVERY NODE
+# that will host a container — `local` is node-local storage, not shared, so
+# a template present on the node you run commands from proves nothing about
+# the others. provision.yml checks per node and prints the exact download
+# command rather than guessing.
+lxc_template: "debian-12-standard_12.12-1_amd64.tar.zst"
 
-# k3s in LXC needs an unprivileged=false container in most setups. Privileged
-# avoids a long tail of cgroup/permission issues; this is a lab cluster on a
-# trusted network, and the trade is deliberate.
-lxc_unprivileged: false
+# UNPRIVILEGED — required, not preferred. This is the PROVEN configuration.
+#
+# Proxmox reserves every LXC feature flag except `nesting` to root@pam:
+#   "changing feature flags (except nesting) is only allowed for root@pam"
+# No ACL grant lifts that, so an API token cannot create a privileged
+# container with the flags k3s needs. `false` is simply unreachable for
+# token-driven automation regardless of what you grant it.
+#
+# This is a BETTER outcome than the privileged recipe most k3s-in-LXC guides
+# assume. The cluster runs at a stricter isolation level, and the root SSH
+# channel is used for exactly one thing (keyctl plus the raw lxc.* options)
+# rather than becoming the general-purpose path of least resistance.
+#
+# Verified working: unprivileged + nesting + keyctl + KubeletInUserNamespace
+# on k3s v1.31.4, across PVE 8.4.5 and 9.2.2 nodes in one cluster. Prefer
+# this over the privileged fallback for an ARM edge rebuild too — it is the
+# configuration with evidence behind it.
+lxc_unprivileged: true
 
 # --- VM specifics (ignored when node_type: lxc) -----------------------------
 vm_image: "debian-12-genericcloud-amd64.qcow2"
@@ -50,6 +67,25 @@ k3s_disable: []
 # Extra server args. --write-kubeconfig-mode is what lets the playbook fetch
 # a usable kubeconfig without root gymnastics.
 k3s_server_args: "--write-kubeconfig-mode 644"
+
+# REQUIRED IN UNPRIVILEGED LXC — applied to the server AND every agent.
+#
+# kubelet writes global kernel tunables at startup (vm/overcommit_memory,
+# kernel/panic, kernel/panic_on_oops). Those are readable but not writable
+# from inside a user namespace, so ContainerManager refuses to start:
+#
+#   Failed to start ContainerManager err="[open /proc/sys/vm/overcommit_memory:
+#   permission denied, open /proc/sys/kernel/panic: permission denied, ...]"
+#
+# The service then CRASH-LOOPS in `activating` rather than failing outright,
+# so `systemctl status` shows something perpetually almost-starting. k3s
+# prints the remedy itself: "Hint: enable KubeletInUserNamespace feature flag
+# to ignore the error" — the gate makes kubelet skip writes it cannot perform.
+#
+# Since lxc_unprivileged is forced true by the API permission model, this is
+# effectively mandatory. Empty it only if you run these playbooks against
+# VMs (node_type: vm), where kubelet can write those tunables normally.
+k3s_kubelet_args: "--kubelet-arg=feature-gates=KubeletInUserNamespace=true"
 
 # LXC-only: overlayfs inside a container is the most common k3s-in-LXC
 # failure. If containerd will not start, set this to "native".

@@ -12,10 +12,16 @@
 #
 # Idempotent: re-running against existing containers is a no-op.
 #
-# UNVERIFIED against a real Proxmox host — see README §Verification status.
-# The two things most likely to need adjustment are storage/bridge names and
-# template availability, both of which are checked explicitly below rather
-# than assumed.
+# VERIFIED 2026-08-08 against a real, MIXED-VERSION Proxmox cluster:
+# PVE 8.4.5 and PVE 9.2.2 nodes in one cluster, 5 LXC nodes created and
+# started. Everything below that carries a "why" comment earned it by
+# failing first — see git history for the sequence.
+#
+# The permission model is the part worth knowing before reading further: an
+# API token can set the `nesting` feature flag and nothing else, so `keyctl`
+# is applied over root SSH, and privileged containers are unreachable to a
+# token entirely. That single constraint is what forces unprivileged
+# containers, which in turn forces KubeletInUserNamespace in k3s_install.
 # =============================================================================
 
 - name: Provision k3s nodes on Proxmox
@@ -44,65 +50,276 @@
       run_once: true
 
     # -------------------------------------------------------------------
+    # Template availability — CHECKED PER NODE, and that is the whole point.
+    #
+    # `local` is NODE-LOCAL storage, not cluster-shared. A template present
+    # on the node you happen to run commands from says NOTHING about the
+    # other nodes. Observed for real: the template existed on one of four
+    # nodes, and nothing in the API surfaced that until each node was asked
+    # individually.
+    #
+    # Deliberately NOT run_once — it must execute for every host, because
+    # the answer differs per host. A run_once check here would pass on the
+    # first node and let the other three fail mid-run, after containers had
+    # already been created.
+    # -------------------------------------------------------------------
+    - name: List LXC templates available on this host's Proxmox node
+      when: node_type == 'lxc'
+      ansible.builtin.uri:
+        url: >-
+          https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ pve_node }}/storage/{{ proxmox_template_storage }}/content?content=vztmpl
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: template_list
+      changed_when: false
+      no_log: true          # the API token is in the request header
+
+    - name: Assert the configured template exists on THIS node
+      when: node_type == 'lxc'
+      vars:
+        available: >-
+          {{ template_list.json.data
+             | map(attribute='volid')
+             | map('regex_replace', '^.*/', '')
+             | list }}
+      ansible.builtin.assert:
+        that: lxc_template in available
+        fail_msg: >-
+          '{{ lxc_template }}' is NOT on {{ pve_node }}:{{ proxmox_template_storage }}
+          (needed for {{ inventory_hostname }}).
+          Present there: {{ available | join(', ') | default('nothing', true) }}.
+          `{{ proxmox_template_storage }}` is node-local, so each node needs its
+          own copy. Fix with:
+            pvesh create /nodes/{{ pve_node }}/aplinfo
+              --storage {{ proxmox_template_storage }} --template {{ lxc_template }}
+        success_msg: "{{ lxc_template }} present on {{ pve_node }}"
+
+    # -------------------------------------------------------------------
     # LXC path
     # -------------------------------------------------------------------
     - name: Create LXC container
       when: node_type == 'lxc'
-      community.general.proxmox:
+      community.proxmox.proxmox:
         api_host: "{{ proxmox_api_host }}"
         api_user: "{{ proxmox_api_user }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
         node: "{{ pve_node }}"
         vmid: "{{ vmid }}"
         hostname: "{{ inventory_hostname }}"
         ostemplate: "{{ proxmox_template_storage }}:vztmpl/{{ lxc_template }}"
-        storage: "{{ proxmox_storage }}"
         cores: "{{ cores }}"
         memory: "{{ memory }}"
-        disk: "{{ disk }}"
+        # STRUCTURED rootfs, not `storage:` + `disk: 40`.
+        #
+        # Modern Proxmox (verified on 8.4.5) enforces `<STORAGE>:<SIZE>` and
+        # no longer accepts a bare size alongside a `storage` parameter. A
+        # plain `40` is parsed as a FILESYSTEM PATH, and the resulting error
+        # — "Only root can pass arbitrary filesystem paths" — describes a
+        # privilege problem rather than the format problem it actually is,
+        # which sends you hunting for a missing permission that is not the
+        # cause. disk_volume states storage and size separately so there is
+        # nothing to misparse. It is mutually exclusive with `storage`/`disk`.
+        disk_volume:
+          storage: "{{ proxmox_storage }}"
+          size: "{{ disk | int }}"
+        # REQUIRED when the API token is pool-scoped. A least-privilege token
+        # holds VM.Allocate on /pool/<name> rather than cluster-wide, so a
+        # guest created OUTSIDE the pool is refused with 403 — the token
+        # working as designed, not a bug. Creating into the pool is exactly
+        # what the grant permits.
+        pool: "{{ proxmox_pool }}"
         netif:
           net0: "name=eth0,gw={{ gateway }},ip={{ ip }},bridge={{ proxmox_bridge }}"
+        # DNS IS DELIBERATELY NOT SET HERE.
+        #
+        # Passing `nameserver` (or `searchdomain`) on container create makes
+        # Proxmox demand Sys.Modify on `/` — a broad, cluster-wide privilege
+        # that a least-privilege pool-scoped token should not hold, and that
+        # would be a poor trade for setting a resolver.
+        #
+        # Omitting it is not a compromise: Proxmox then copies the HOST's
+        # resolver configuration into the container, which is correct here.
+        # k3s_node_prep asserts DNS actually resolves rather than trusting
+        # that inheritance happened — see `dns_server` for the intended value.
         # unprivileged=false avoids a long tail of cgroup/permission issues
         # for k3s. Deliberate trade on a lab cluster (see group_vars).
         unprivileged: "{{ lxc_unprivileged }}"
         onboot: true
-        # THE LOAD-BEARING LINE for k3s-in-LXC. nesting lets containers run
-        # inside the container; keyctl is required by containerd. Without
-        # both, k3s fails in ways that look like unrelated kernel errors.
+        # NESTING ONLY HERE — keyctl is applied as root in the next task.
+        #
+        # Proxmox permits a non-root user to set `nesting`, and NOTHING else:
+        #   "changing feature flags (except nesting) is only allowed for
+        #    root@pam"
+        # No ACL grant lifts this; it is a hard rule about who you are, not
+        # what you hold. keyctl (required by containerd) therefore cannot be
+        # set through the API token at all, so it is applied over the root
+        # SSH session this playbook already relies on.
         features:
           - nesting=1
-          - keyctl=1
         pubkey: "{{ ssh_public_key }}"
         state: present
+        # CREATE-IF-ABSENT, NEVER UPDATE — this is what makes re-runs safe.
+        #
+        # The module's `update` default flipped from false to true in
+        # community.proxmox 1.0.0, so `state: present` now tries to UPDATE an
+        # existing container. That path is broken in 2.0.0: `cmode` defaults
+        # to the sentinel 'default', which the module correctly omits on
+        # create but forwards verbatim on update, and the API enum accepts
+        # only shell/console/tty:
+        #   400 Bad Request ... {'cmode': "value 'default' does not have a
+        #   value in the enumeration 'shell, console, tty'"}
+        # First run therefore succeeds and the second fails — the worst shape
+        # for a bug, since it looks like the run "broke something".
+        #
+        # CONSEQUENCE, stated because it is a real limitation: changing
+        # cores/memory/disk in inventory will NOT be applied by re-running.
+        # Resize in the Proxmox UI, or destroy the container and re-run.
+        update: false
       register: lxc_create
 
-    # Raw lxc.* options the module does not expose. Written directly to the
-    # container config on the Proxmox host.
+    # -------------------------------------------------------------------
+    # keyctl — applied AS ROOT, because the API token structurally cannot.
     #
-    # AppArmor confinement blocks containerd's mount operations; dropping the
-    # profile is the standard k3s-in-LXC remedy. This is why the README calls
-    # this the most Proxmox-version-sensitive part of the repo.
-    - name: Apply raw LXC options required by k3s
+    # containerd requires keyctl; without it k3s fails in ways that read as
+    # unrelated kernel errors. Proxmox reserves every feature flag except
+    # `nesting` to root@pam, so this runs over the root SSH session rather
+    # than through the token.
+    #
+    # `pvesh` rather than `pct` deliberately: pct is node-local and would
+    # have to run on the node owning each container, whereas pvesh addresses
+    # any node in the cluster from this one host — the same reason the
+    # /etc/pve write below works from a single delegate.
+    #
+    # Must land BEFORE the container starts; feature flags are read at boot.
+    # -------------------------------------------------------------------
+    - name: Read current LXC feature flags
       when: node_type == 'lxc'
       delegate_to: "{{ proxmox_api_host }}"
-      ansible.builtin.blockinfile:
-        path: "/etc/pve/lxc/{{ vmid }}.conf"
-        marker: "# {mark} MANAGED BY edgy-infra (k3s requirements)"
-        block: |
-          lxc.apparmor.profile: unconfined
-          lxc.cgroup2.devices.allow: a
-          lxc.cap.drop:
-          lxc.mount.auto: "proc:rw sys:rw"
-        create: false
+      # delegate_to ALONE IS NOT ENOUGH HERE.
+      #
+      # This play sets `connection: local` (the target nodes do not exist
+      # yet), and delegated tasks INHERIT the play's connection. So without
+      # this override the task delegates in name only and actually executes
+      # on the control node — where /usr/bin/pvesh does not exist, producing
+      # an ENOENT for an absolute path that is demonstrably present on the
+      # Proxmox host. The same trap silently redirects the /etc/pve write
+      # below to the control node's filesystem.
+      vars:
+        ansible_connection: ssh
+        ansible_user: root
+      ansible.builtin.command:
+        argv:
+          # ABSOLUTE PATH — the command module runs without a shell and with a
+          # minimal environment, so a bare `pvesh` is not resolved even though
+          # it sits in /usr/bin and works fine in an interactive SSH session.
+          - /usr/bin/pvesh
+          - get
+          - "/nodes/{{ pve_node }}/lxc/{{ vmid }}/config"
+          - "--output-format"
+          - json
+      register: lxc_config_raw
+      changed_when: false
+
+    - name: Apply keyctl feature flag as root
+      # Reading first, then setting only when absent, so a re-run reports
+      # `ok` instead of a permanent `changed`. A task hardcoded to
+      # changed_when: true makes every run look like it modified the cluster,
+      # which trains you to ignore the one run that actually did.
+      when:
+        - node_type == 'lxc'
+        - "'keyctl=1' not in ((lxc_config_raw.stdout | from_json).features | default(''))"
+      delegate_to: "{{ proxmox_api_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: root
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/pvesh
+          - set
+          - "/nodes/{{ pve_node }}/lxc/{{ vmid }}/config"
+          - "--features"
+          - "nesting=1,keyctl=1"
+
+    # -------------------------------------------------------------------
+    # Raw lxc.* options the API does not expose. AppArmor confinement blocks
+    # containerd's mount operations, so dropping the profile is the standard
+    # k3s-in-LXC remedy.
+    #
+    # WHY THIS IS A REWRITE AND NOT blockinfile/lineinfile:
+    #
+    # /etc/pve is not an ordinary file — it is a FUSE filesystem that Proxmox
+    # parses and RE-EMITS. It hoists leading `#` lines into the container's
+    # description and re-appends raw lxc.* keys at the end of the file. A
+    # marker-delimited block therefore gets separated from the lines it is
+    # supposed to bracket, so on the next run blockinfile cannot find its own
+    # block and appends a fresh copy. Observed for real: four duplicate copies
+    # of every lxc.* line after four runs, growing without bound, and the task
+    # reporting `changed` forever.
+    #
+    # lineinfile is no better: with `state: present` it replaces only the LAST
+    # match and leaves earlier duplicates in place.
+    #
+    # So: filter out every line we manage (plus any legacy markers), append
+    # exactly one copy of each, and write back only if the result differs.
+    # That converges from an already-duplicated file rather than needing a
+    # manual cleanup first, and reports `changed` truthfully.
+    # -------------------------------------------------------------------
+    - name: Ensure raw LXC options are present exactly once
+      when: node_type == 'lxc'
+      delegate_to: "{{ proxmox_api_host }}"
+      # Same connection override as the keyctl task — without it this writes
+      # to the CONTROL NODE's /etc/pve, not the Proxmox host's.
+      vars:
+        ansible_connection: ssh
+        ansible_user: root
+      # NODE-QUALIFIED PATH — /etc/pve/lxc/ is NOT cluster-wide. /etc/pve is
+      # replicated, but /etc/pve/lxc is a SYMLINK to
+      # /etc/pve/nodes/<local-node>/lxc, so it resolves only to guests on the
+      # node you happen to be connected to. Delegating every host to one node
+      # therefore reported "does not exist" for containers that did exist.
+      ansible.builtin.shell: |
+        set -eu
+        conf=/etc/pve/nodes/{{ pve_node }}/lxc/{{ vmid }}.conf
+        tmp=$(mktemp)
+        grep -vE '^(lxc\.apparmor\.profile|lxc\.cgroup2\.devices\.allow|lxc\.cap\.drop|lxc\.mount\.auto)[[:space:]]*:' "$conf" \
+          | grep -vE '^# (BEGIN|END) MANAGED BY edgy-infra' > "$tmp"
+        cat >> "$tmp" <<'RAWOPTS'
+        lxc.apparmor.profile: unconfined
+        lxc.cgroup2.devices.allow: a
+        lxc.cap.drop:
+        lxc.mount.auto: "proc:rw sys:rw"
+        RAWOPTS
+        # Compare with TRAILING WHITESPACE NORMALIZED. Proxmox rewrites
+        # `lxc.cap.drop:` as `lxc.cap.drop: ` (valueless key, trailing space),
+        # so a byte-exact cmp would differ from what we write every single
+        # time and report `changed` forever.
+        if diff -q <(sed 's/[[:space:]]*$//' "$conf") <(sed 's/[[:space:]]*$//' "$tmp") >/dev/null; then
+          rm -f "$tmp"; echo NOCHANGE
+        else
+          cat "$tmp" > "$conf"; rm -f "$tmp"; echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: raw_lxc_opts
+      # EQUALITY, NOT SUBSTRING — and the sentinels deliberately do not
+      # contain one another. `'CHANGED' in 'UNCHANGED'` is true, so the
+      # obvious spelling reports every run as changed while the task is in
+      # fact converged. NOCHANGE shares no substring with CHANGED, so even a
+      # careless rewrite of this line cannot resurrect the bug.
+      changed_when: (raw_lxc_opts.stdout | trim) == 'CHANGED'
 
     - name: Start LXC container
       when: node_type == 'lxc'
-      community.general.proxmox:
+      community.proxmox.proxmox:
         api_host: "{{ proxmox_api_host }}"
         api_user: "{{ proxmox_api_user }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
         node: "{{ pve_node }}"
         vmid: "{{ vmid }}"
         state: started
@@ -113,20 +330,27 @@
     # -------------------------------------------------------------------
     - name: Create VM from cloud image
       when: node_type == 'vm'
-      community.general.proxmox_kvm:
+      community.proxmox.proxmox_kvm:
         api_host: "{{ proxmox_api_host }}"
         api_user: "{{ proxmox_api_user }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
         node: "{{ pve_node }}"
         vmid: "{{ vmid }}"
         name: "{{ inventory_hostname }}"
         cores: "{{ cores }}"
         memory: "{{ memory }}"
+        # Same pool requirement as the LXC path — see the comment there.
+        pool: "{{ proxmox_pool }}"
         net:
           net0: "virtio,bridge={{ proxmox_bridge }}"
         ipconfig:
           ipconfig0: "ip={{ ip }},gw={{ gateway }}"
+        # cloud-init resolver. Plural here; the LXC module spells it
+        # `nameserver` singular. Same need, different module vocabulary.
+        nameservers:
+          - "{{ dns_server }}"
         sshkeys: "{{ ssh_public_key }}"
         ciuser: "{{ ansible_user }}"
         onboot: true
@@ -134,11 +358,12 @@
 
     - name: Start VM
       when: node_type == 'vm'
-      community.general.proxmox_kvm:
+      community.proxmox.proxmox_kvm:
         api_host: "{{ proxmox_api_host }}"
         api_user: "{{ proxmox_api_user }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
         node: "{{ pve_node }}"
         vmid: "{{ vmid }}"
         state: started

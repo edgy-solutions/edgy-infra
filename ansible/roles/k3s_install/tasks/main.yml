@@ -25,7 +25,7 @@
     set -o pipefail
     curl -sfL https://get.k3s.io | \
       INSTALL_K3S_VERSION="{{ k3s_version }}" \
-      INSTALL_K3S_EXEC="server {{ k3s_server_args }} {{ k3s_disable | map('regex_replace', '^', '--disable ') | join(' ') }} {{ ('--snapshotter=' + k3s_snapshotter) if k3s_snapshotter else '' }}" \
+      INSTALL_K3S_EXEC="server {{ k3s_server_args }} {{ k3s_kubelet_args }} {{ k3s_disable | map('regex_replace', '^', '--disable ') | join(' ') }} {{ ('--snapshotter=' + k3s_snapshotter) if k3s_snapshotter else '' }}" \
       sh -
   args:
     executable: /bin/bash
@@ -65,7 +65,7 @@
       INSTALL_K3S_VERSION="{{ k3s_version }}" \
       K3S_URL="https://{{ k3s_server_host }}:6443" \
       K3S_TOKEN="{{ hostvars[groups['k3s_server'][0]]['k3s_node_token'] }}" \
-      INSTALL_K3S_EXEC="agent {{ ('--snapshotter=' + k3s_snapshotter) if k3s_snapshotter else '' }}" \
+      INSTALL_K3S_EXEC="agent {{ k3s_kubelet_args }} {{ ('--snapshotter=' + k3s_snapshotter) if k3s_snapshotter else '' }}" \
       sh -
   args:
     executable: /bin/bash
