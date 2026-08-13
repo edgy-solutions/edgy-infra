@@ -191,9 +191,46 @@ clusters), so the lab rehearses the real management topology too.
 
 ## Prerequisites
 
-Five things must exist before `provision.yml` will get anywhere. Each was a
-real blocker on the first run; none is discoverable from the error you get
-without it.
+**0. Point `KUBECONFIG` at this cluster, and verify it, before any `kubectl`
+command.** This one is not about provisioning — it is about every session
+afterwards, and it is listed first because getting it wrong is silent and
+immediate.
+
+```bash
+export KUBECONFIG="$(git rev-parse --show-toplevel)/ansible/kubeconfig"
+kubectl config current-context      # MUST print: edgy-lab
+```
+
+**Why this is a required action and not a note.** This cluster's kubeconfig
+is **not** in `~/.kube/config`. It is written to `ansible/kubeconfig` and
+lives only there. A shell that has not exported the variable does not fail —
+it silently resolves to whatever `~/.kube/config` has current, and on the
+machine this was built from, **that default is a long-lived production
+cluster**, not the lab.
+
+The failure mode is the dangerous shape: **a command aimed at the lab lands
+on another cluster, succeeds, and returns plausible output.** Nothing
+errors. The namespaces even have familiar names. The only tell is age — this
+lab is days old, the default context's namespaces are years old — and nobody
+checks age before running a read.
+
+Same class as the ACL blind spots below: **a boundary that exists but does
+not announce itself.** *What the token deliberately cannot see* records what
+this tooling is prevented from reaching; this records what your shell will
+reach for when you have not told it otherwise. Treat `current-context`
+returning anything but `edgy-lab` as a stop.
+
+*Corollary for anyone operating under a "this cluster only" instruction:*
+verify the context **before** the first command, not after the first
+surprising result. A read that hit the wrong cluster has already happened by
+the time its output looks odd — and reads are not automatically harmless:
+they appear in audit logs and are indistinguishable from a probe.
+
+---
+
+Five further things must exist before `provision.yml` will get anywhere.
+Each was a real blocker on the first run; none is discoverable from the
+error you get without it.
 
 **1. A Proxmox API token, and the ACL grants it needs.** The token's rights
 are the intersection of the *token's* ACL and the *user's* — granting only
