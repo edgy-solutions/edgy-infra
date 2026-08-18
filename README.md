@@ -170,6 +170,22 @@ fifth Proxmox node returning from repair is simply `+1 agent`; with a
 cluster with a playbook that makes rebuild cheap, so an HA control plane
 buys overhead and nothing else.
 
+**That prediction was tested on 2026-08-15 and held.** The fifth node
+returned and the inventory change was exactly one host entry —
+`k3s-agent-5`, `pve_node: pve-5`, next address in the block — with no
+edit to the server, the join logic, or any other agent:
+
+```
+pve-5  →  k3s-agent-5                      (added 2026-08-15)
+```
+
+*Worth recording because the alternative was not obviously worse at design
+time.* An HA control plane would have been the conventional choice, and its
+cost would have shown up here rather than at design review: the same
+one-node addition becomes a quorum change requiring the etcd members to be
+reconsidered. The cheap-rebuild argument was the stated reason; **the
+single-entry diff is the evidence for it.**
+
 ---
 
 ## Rancher: import, never join
