@@ -63,6 +63,42 @@
     # first node and let the other three fail mid-run, after containers had
     # already been created.
     # -------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Credential pre-flight. MUST run before any no_log task.
+    #
+    # The token comes from the PROXMOX_TOKEN environment variable, so the
+    # commonest failure by far is "you forgot to export it". Without this
+    # check that failure surfaces inside the template-list task below, which
+    # carries `no_log: true` to keep the token out of the log — and no_log
+    # censors the DIAGNOSIS along with the secret. The operator sees:
+    #
+    #   fatal: [host]: FAILED! => {"censored": "the output has been hidden..."}
+    #
+    # which reads as a permissions or template problem on the Proxmox node
+    # and sends you looking at ACLs. Cost a diagnostic cycle on 2026-08-19.
+    #
+    # A secret-redaction control that also redacts the reason for failure is
+    # a control that trades one problem for a worse one. The fix is to fail
+    # EARLIER, where nothing sensitive is in scope yet and the message can be
+    # plain.
+    # -------------------------------------------------------------------
+    - name: Pre-flight — the Proxmox API token must be present
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - proxmox_api_token_secret is defined
+          - proxmox_api_token_secret | length > 0
+          - "'lookup(' not in proxmox_api_token_secret"
+        fail_msg: >-
+          PROXMOX_TOKEN is not set in this shell. group_vars/all.yml reads it
+          from the environment on purpose (secrets never enter git), so the
+          playbook cannot supply it. Export it and re-run:
+              export PROXMOX_TOKEN='<the API token secret>'
+          If it IS exported and you still see this, the shell running
+          ansible-playbook is not the shell you exported it in — check WSL vs
+          Windows, and sudo, which drops the environment by default.
+        success_msg: "Proxmox API token present."
+
     - name: List LXC templates available on this host's Proxmox node
       when: node_type == 'lxc'
       ansible.builtin.uri:

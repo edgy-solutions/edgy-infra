@@ -52,7 +52,7 @@ specific way. The findings below are recorded because each is cheap to hit
 again and expensive to diagnose from its error message: in most cases the
 message names something other than the actual cause.
 
-### The nine first-run findings
+### The ten first-run findings
 
 | # | Symptom | Actual cause |
 |---|---------|--------------|
@@ -65,6 +65,8 @@ message names something other than the actual cause.
 | 7 | `ENOENT` on an absolute path that demonstrably exists | `delegate_to` **inherits the play's `connection: local`**, so the task ran on the control node. Override `ansible_connection` on each delegated task. |
 | 8 | `Path /etc/pve/lxc/<vmid>.conf does not exist` — for containers that do exist | `/etc/pve/lxc` is a **symlink to the local node's** directory. `/etc/pve` is replicated; that path is not. Use `/etc/pve/nodes/<node>/lxc`. |
 | 9 | Raw `lxc.*` options duplicating on every run | `blockinfile` is wrong for `/etc/pve`. Proxmox re-emits the file and hoists `#` lines into the container *description*, detaching markers from the lines they bracket. Replaced with a deterministic rewrite that converges from an already-duplicated file. |
+
+| 10 | An opaque `{"censored": "the output has been hidden..."}` failure on the template pre-flight | **`PROXMOX_TOKEN` was not exported.** `group_vars/all.yml` reads the token from the environment, and the first task to use it carries `no_log: true` — which censors the *diagnosis* along with the secret. It reads as an ACL or template problem on the Proxmox node and sends you to the wrong place. A credential pre-flight now runs **before** any `no_log` task and says so in plain words. *A redaction control that also redacts the reason for failure trades one problem for a worse one.* |
 
 And one that appears only on the **second** run: `community.proxmox`'s
 `update` default flipped to `true` in 1.0.0, and the update path is broken in
